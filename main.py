@@ -49,14 +49,16 @@ def require_auth(authorization: Optional[str] = Header(None)) -> Dict:
         raise HTTPException(status_code=401, detail="Invalid session")
     if session.get('expires_at') and session['expires_at'] < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Session expired")
-    user = db['user'].find_one({"_id": session['user_id']}) if isinstance(session.get('user_id'), dict) else db['user'].find_one({"_id": session.get('user_id')})
-    # If stored as string id, resolve
-    if not user:
-        # try by string id
-        user = db['user'].find_one({"_id": session.get('user_id')})
+    user = db['user'].find_one({"_id": session.get('user_id')})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return {"user": user, "session": session}
+
+
+def label_for_user(u: Dict) -> str:
+    if not u:
+        return "Unknown"
+    return u.get('username') or u.get('name') or u.get('email') or "User"
 
 
 # ----------------------
@@ -161,7 +163,7 @@ def register(body: RegisterBody):
         "two_fa_secret": None,
         "transaction_pin_hash": None,
         "iban": None,
-        "balance": 0.0,
+        "balance": 250.0,  # welcome demo balance so users can try sending
         "avatar_url": None,
         "created_at": datetime.now(timezone.utc),
     }
@@ -253,9 +255,31 @@ def find_user_by_identifier(identifier: str):
 def feed(limit: int = 25, auth=Depends(require_auth)):
     uid = auth['user']['_id']
     txs = list(db['transaction'].find({"$or": [{"sender_id": str(uid)}, {"receiver_id": str(uid)}]}).sort("created_at", -1).limit(limit))
+    enriched = []
     for t in txs:
-        t['id'] = str(t.pop('_id'))
-    return txs
+        t_id = str(t.pop('_id'))
+        sender = db['user'].find_one({"_id": t.get('sender_id') and None})
+        # sender_id/receiver_id stored as strings, fetch via ObjectId not possible, try by string compare
+        sender = db['user'].find_one({"_id": t.get('sender_id')}) or db['user'].find_one({"_id": t.get('sender_id')})
+        # Fallback: fetch by string match
+        if not sender:
+            sender = db['user'].find_one({"_id": t.get('sender_id')})
+        receiver = db['user'].find_one({"_id": t.get('receiver_id')}) or db['user'].find_one({"_id": t.get('receiver_id')})
+        item = {
+            "id": t_id,
+            "amount": t.get('amount', 0.0),
+            "message": t.get('message'),
+            "status": t.get('status'),
+            "created_at": t.get('created_at'),
+            "from_label": label_for_user(sender) if sender else "Unknown",
+            "to_label": label_for_user(receiver) if receiver else "Unknown",
+            "sender_id": t.get('sender_id'),
+            "receiver_id": t.get('receiver_id'),
+            "type": 'in' if t.get('receiver_id') == str(uid) else 'out',
+            "user_is_receiver": t.get('receiver_id') == str(uid)
+        }
+        enriched.append(item)
+    return enriched
 
 
 @app.get("/api/balance")
@@ -280,7 +304,7 @@ def send(body: SendBody, auth=Depends(require_auth)):
     if float(sender.get('balance', 0.0)) < body.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
-    # Update balances atomically-ish (simplified for demo)
+    # Update balances
     db['user'].update_one({"_id": sender['_id']}, {"$inc": {"balance": -body.amount}})
     db['user'].update_one({"_id": receiver['_id']}, {"$inc": {"balance": body.amount}})
 
